@@ -23,7 +23,7 @@ Contents:
 - Framework: [rlgymppo_rs](https://github.com/VirxEC/rlgymppo_rs) by VirxEC
   and contributors, a Rust port of GigaLearn. This repository keeps its full
   git history; `upstream` points at it for rebases.
-- Speed ideas (bf16 autocast, values from rollout inference, CUDA graphs)
+- Speed ideas (bf16 autocast, values from rollout inference, CUDA graphs; see [Roadmap](#roadmap-next-optimizations))
   come from buta-ppo (MIT). No buta-ppo code is included yet.
 - Simulation: RocketSim v3 through [RLGym-rs](https://github.com/VirxEC/rlgym_rs).
   Tensors and autodiff: [Burn](https://burn.dev) 0.22.
@@ -44,7 +44,7 @@ default; faster numerics are opt-in.
 | CI: rustfmt, clippy, CPU tests | `.github/workflows/ci.yml` | n/a | |
 | Documented LibTorch + TF32 training | this README | Opt-in via the existing `torch` feature | LibTorch's cuBLAS TF32 path is ~1.8x faster per training step than Burn CUDA f32. |
 
-Not adopted yet, with reasons, in [Future work](#future-work).
+Not adopted yet, with reasons, in [Roadmap](#roadmap-next-optimizations).
 
 ## Architecture
 
@@ -333,18 +333,30 @@ To benchmark: run a trainer with `num_additional_iterations` and
 `Throughput/overall` and `Timing/consumption`, skipping the first three
 iterations.
 
-### Future work
+### Roadmap (next optimizations)
 
-- **Values from rollout inference** (buta's stage 3). Here the value pass is
-  one batched forward over the resident rollout, ~0.08 s per 100k steps
-  (~6% of an iteration). Reusing values from collection would instead add a
-  critic forward to every small inference batch, which costs about as much as
-  the actor's ~0.28 s of collection inference. It only pays off once
-  collection inference is graph-captured, so it is deferred with the next
-  item.
-- **CUDA graphs and GPU-resident rollouts.** Need LibTorch graph capture,
-  which Burn does not expose.
-- **Overlapping collection with learning.**
+Stages 1–2 (bf16 autocast for the critic, TF32, the resident-state update
+pipeline) are done. Planned next, in order:
+
+- [ ] **Stage 3: value reuse with fused graphs.** Return values from the
+  rollout inference pass instead of a separate critic pass over the
+  rollout. That pass costs about 0.08 s per 100k steps (about 6% of an
+  iteration). Done naively, it adds a critic forward to every small
+  inference batch, which costs about as much as the actor's 0.28 s of
+  collection inference. It only pays off with actor and critic fused into
+  one captured graph (stage 4).
+- [ ] **Stage 4: CUDA graphs for collection inference.** Capture the
+  fixed-shape policy (and critic) forward once and replay it each step, to
+  cut kernel-launch and dispatch overhead on the small batches. Burn
+  doesn't expose this, so it needs LibTorch graph capture through `tch`.
+- [ ] **Stage 5: GPU-resident rollout buffer.** Write observations,
+  actions, log-probs and values straight into preallocated device tensors
+  during collection, instead of staging on the host and uploading once per
+  iteration (about 0.5 s of upload per 100k steps today).
+- [ ] Overlap collection with learning (double-buffered rollouts).
+
+Benchmark each stage with the method above against the current median
+(about 75k sps on an L4 in the 1v1 bot, 4×[2048, 2048, 1024, 1024]).
 
 ## Install and usage
 
