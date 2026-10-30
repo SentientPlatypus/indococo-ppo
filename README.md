@@ -1,105 +1,405 @@
-## indococo-ppo
+# indococo-ppo
 
-`indococo-ppo` is a fork of [VirxEC/rlgymppo_rs](https://github.com/VirxEC/rlgymppo_rs)
-tuned for training the Indonesian Coconut Rocket League bot faster on a single
-NVIDIA GPU. All credit for the framework goes to VirxEC and the rlgymppo_rs
-contributors; this fork only adds learner-side speedups, borrowing ideas from
-buta-ppo (MIT). It stays GPL-2.0, like upstream.
+`indococo-ppo` is a PPO trainer for Rocket League bots, written in Rust. It is
+a fork of [VirxEC/rlgymppo_rs](https://github.com/VirxEC/rlgymppo_rs) that adds
+learner-side speedups so the Indonesian Coconut bot trains faster on one
+NVIDIA GPU. The framework itself is VirxEC's work; see [Credits and
+license](#credits-and-license).
 
-Every change keeps upstream numerics by default. Faster numerics are opt-in.
+Contents:
 
-### What the fork changes
+1. [Credits and license](#credits-and-license)
+2. [Differences from upstream](#differences-from-upstream)
+3. [Architecture](#architecture)
+4. [Backends and precision](#backends-and-precision)
+5. [Configuration flags](#configuration-flags)
+6. [Performance](#performance)
+7. [Install and usage](#install-and-usage)
+8. [Development](#development)
+9. [Upstream README](#upstream-readme)
 
-| Change | Where | Default |
+## Credits and license
+
+- Framework: [rlgymppo_rs](https://github.com/VirxEC/rlgymppo_rs) by VirxEC
+  and contributors, a Rust port of GigaLearn. This repository keeps its full
+  git history; `upstream` points at it for rebases.
+- Speed ideas (bf16 autocast, values from rollout inference, CUDA graphs)
+  come from buta-ppo (MIT). No buta-ppo code is included yet.
+- Simulation: RocketSim v3 through [RLGym-rs](https://github.com/VirxEC/rlgym_rs).
+  Tensors and autodiff: [Burn](https://burn.dev) 0.22.
+- License: **GPL-2.0**, inherited from upstream (see `LICENSE`). If you
+  distribute a binary built from this code, you must also offer its source.
+
+## Differences from upstream
+
+Forked from upstream commit `86bd822`. Every change keeps upstream numerics by
+default; faster numerics are opt-in.
+
+| Change | Files | Default | Why |
+|---|---|---|---|
+| Update-magnitude metrics computed on the GPU | `rlgymppo/src/agent/update_magnitude.rs` | Always on | Upstream downloaded all ~15.6M weights to the CPU twice per iteration (~60 ms). Now it keeps tensor handles (no copy) and reads back two scalars. |
+| bf16 mixed precision per network for the PPO update | `rlgymppo-model/src/precision.rs`, `Net::forward_with`, `PpoLearnerConfig::precision` | Off (f32) | bf16 matmuls are ~2-3x faster on Ada/Ampere GPUs. |
+| Clipped PPO loss in its own tested module | `rlgymppo/src/agent/ppo_loss.rs` | No behaviour change | Readability and unit tests. |
+| Clippy fixes (`render.rs`, removed unused `GameInstance::step_vis`) | `rlgymppo/src/environment/` | No behaviour change | `clippy -D warnings` passes. |
+| CI: rustfmt, clippy, CPU tests | `.github/workflows/ci.yml` | n/a | |
+| Documented LibTorch + TF32 training | this README | Opt-in via the existing `torch` feature | LibTorch's cuBLAS TF32 path is ~1.8x faster per training step than Burn CUDA f32. |
+
+Not adopted yet, with reasons, in [Future work](#future-work).
+
+## Architecture
+
+### Workspace layout
+
+| Crate | Owns |
+|---|---|
+| `rlgymppo` | The learner: `Learner` (training loop, checkpoints, self-play, metrics fan-out), `Ppo` (GAE + PPO update), the collectors (`ThreadSim` → `PoolCollector` → `BatchSim`), and the rollout `Memory`. |
+| `rlgymppo-model` | Device-agnostic networks: `Net` (MLP), `Actic` (actor, critic, optional shared head), action sampling, `ComputePrecision`/`TrainPrecision`, and `Policy` for inference-only loading. |
+| `rlgymppo-utils` | Learner-independent RLGym pieces: `DefaultObs`, `AdvancedObs`, `DefaultAction` (90-action lookup table), rewards, terminals, state setters, `Report`/`AvgTracker` metrics. |
+| `rlgymppo-nexto` | Nexto's model, obs and action table, used as a fixed skill-tracker opponent. |
+| `rlgymppo-rlbot` | RLBot v5 agent that runs an exported policy on Burn Flex (CPU). This is the deploy path, including Windows. |
+| `rlgymppo-tui` | ratatui dashboard. |
+| `rlgymppo-wandb` | Weights & Biases sender (pyo3). |
+| `rlgymppo-trainer`, `rlgymppo-transfer` | Example binaries. |
+
+Modules inside `rlgymppo/src`:
+
+| Module | Owns |
+|---|---|
+| `lib.rs` | `LearnerConfig`, `Learner::learn` (the iteration loop), metrics actor thread, stdin controls, checkpoint cadence. |
+| `agent/mod.rs` | `Ppo::learn`: staging the rollout on the device, value pass, truncation bootstrap, GAE, shuffled minibatches, gradient accumulation, optimizer steps, metrics. |
+| `agent/ppo_loss.rs` | Clipped surrogate, entropy, KL estimate, clip fraction. |
+| `agent/update_magnitude.rs` | GPU-side parameter snapshots for `Update/* magnitude`. |
+| `agent/gae.rs` | GAE, return standardisation, reward clipping (CPU, f32). |
+| `agent/config.rs` | `PpoLearnerConfig` and its sub-configs, optimizer factory. |
+| `agent/self_play.rs` | Saving old policy versions and picking self-play opponents. |
+| `agent/skill_tracker.rs` | Elo ratings against old versions and Nexto. |
+| `agent/transfer_learn.rs` | Teacher → student distillation (not used by the 1v1 bot). |
+| `environment/thread_sim.rs` | `ThreadSim`: splits the step budget across pools and runs them on scoped threads. |
+| `environment/pool_collector.rs` | `PoolCollector`: one `BatchSim` plus its own rayon pool and budget share. |
+| `environment/batch_sim.rs` | `BatchSim`: the per-pool step loop (inference, physics, rewards, trajectory claiming). |
+| `environment/sim.rs` | `GameInstance`: one RocketSim arena with its state setter, obs, action parser, rewards and terminals. |
+| `base/memory.rs` | `Memory`: flat row-major rollout buffers and `MemoryShard` writers. |
+| `utils/serde.rs` | Checkpoint folders (`actor.bpk`, `critic.bpk`, `stats.toml`, optimizer state). |
+
+### Component diagram
+
+```mermaid
+flowchart LR
+  subgraph Learner["Learner (main thread)"]
+    LOOP["Learner::learn loop"]
+    PPO["Ppo::learn<br/>GAE + PPO update"]
+    VM["VersionMgr<br/>(self-play versions)"]
+    CK["serde.rs<br/>checkpoints"]
+  end
+  subgraph Collect["ThreadSim (scoped threads)"]
+    P1["PoolCollector 0<br/>BatchSim + rayon pool"]
+    P2["PoolCollector N"]
+  end
+  subgraph Model["rlgymppo-model"]
+    ACTIC["Actic<br/>actor / critic Net"]
+  end
+  MEM[("Memory<br/>CPU rollout rows")]
+  GPU[("GPU<br/>weights, staged batch")]
+  MA["metrics actor thread"]
+  SKILL["skill tracker"]
+  OUT["TUI / wandb / metrics.jsonl"]
+
+  LOOP -->|"model.valid() each iter"| P1
+  LOOP --> P2
+  P1 -->|MemoryShard rows| MEM
+  P2 --> MEM
+  MEM --> PPO
+  PPO <--> GPU
+  ACTIC --- GPU
+  PPO --> LOOP
+  LOOP --> VM
+  LOOP --> CK
+  LOOP -->|Report| MA
+  SKILL --> MA
+  MA --> OUT
+```
+
+### One iteration, end to end
+
+```mermaid
+sequenceDiagram
+  participant L as Learner (main)
+  participant T as ThreadSim
+  participant P as Pool thread (x num_pools)
+  participant R as rayon workers
+  participant G as GPU
+  participant P2 as Ppo::learn
+  L->>T: run(model.valid(), self_play?)
+  T->>P: scoped spawn, budget share
+  loop until pool budget claimed
+    P->>G: react_flat(obs [rows, obs_w]) -> logits -> sample
+    G-->>P: actions [rows], log_probs [rows]
+    P->>R: step games (action parse, tick_skip physics ticks, rewards, terminals, obs)
+    R-->>P: next obs, rewards, terminals
+    P->>P: claim finished trajectories into MemoryShard
+  end
+  P-->>T: Report + trunc next states
+  T-->>L: &Memory, metrics
+  L->>P2: learn(model, memory)
+  P2->>G: upload states once (f16, resident)
+  P2->>G: critic value pass + truncation bootstrap
+  G-->>P2: values [N]
+  P2->>P2: GAE on CPU
+  loop epochs x batches
+    P2->>G: shuffled batch -> minibatches (narrow)
+    G->>G: forward (f32 / TF32 / bf16), loss, backward, accumulate grads
+    G->>G: AdamW step (+ grad-norm clip)
+  end
+  P2->>G: update magnitudes (2 scalars)
+  P2-->>L: updated model, metrics
+  L->>L: self-play version / checkpoint / send metrics
+```
+
+### Data pipeline
+
+1. **Environment threads.** `ThreadSim` owns `num_pools` `PoolCollector`s.
+   Each iteration it splits `timesteps_per_iteration` across pools and runs
+   each on a `std::thread::scope` thread. A pool owns `num_games_per_pool`
+   `GameInstance`s (one RocketSim `Arena` each) and a private rayon pool of
+   `num_threads_per_pool` workers that step games in parallel.
+2. **State setters and terminals.** On reset a `GameInstance` applies its
+   `StateSetter` (e.g. `WeightedState` of kickoff and random states). After
+   each step its `Terminal` (goal, game end) and `Truncate` (no-touch timeout,
+   `max_episode_length`) decide whether the episode ends, and whether it ends
+   as *terminal* (bootstrap 0) or *truncated* (bootstrap from the next state's
+   value).
+3. **Observation builder.** The env's `Obs` implementation builds one f32 row
+   per player into the pool's flat `next_obs` buffer (`[players, obs_w]`).
+   For Indonesian Coconut 1v1 this is a Rust port of RLGym's `DefaultObs`
+   (`obs_w = 92`, parity-checked to 6e-8 against Python).
+4. **Batched policy inference.** The pool thread uploads `next_obs` as one
+   f32 tensor `[players_in_pool, obs_w]` to the training device, runs the
+   actor (no autodiff, f32) to masked logits `[players, n_actions]`, samples on
+   the device and reads back actions and log-probs. With
+   `action_delay == 0` this is synchronous (`react_flat`); with a delay the
+   submit is overlapped with the delayed physics phase (`submit_react_flat` +
+   `wait`). Each pool runs its own inference, so with two pools the GPU sees
+   two independent streams of small batches.
+5. **Action parsing.** `Action::parse_actions` maps each index to
+   `CarControls` through the lookup table (90 actions for `DefaultAction`) and
+   the env repeats them for `tick_skip` physics ticks (8 for the bot).
+6. **Rewards.** After the ticks, `Reward::get_rewards` returns one f32 per car,
+   usually a `combined_rewards!` weighted sum; components named `Reward/*`
+   are sampled into metrics every `reward_sample_interval` steps.
+7. **Rollout buffer.** Finished (or budget-cut) trajectories are claimed into
+   `MemoryShard`s, which are disjoint row ranges of one `Memory`. Everything is
+   flat, row-major, in host RAM (see the shapes table). Truncated rows also
+   store the next observation in `trunc_next_states`.
+8. **Staging.** `Ppo::learn` converts the states to f16 in parallel and uploads
+   them once; they stay resident on the GPU for the whole update. Each slice is
+   cast back to f32 right before it enters a network.
+9. **Values and GAE.** The critic runs over the resident states in
+   `gpu_timestep_buffer_size` chunks, and over `trunc_next_states` for the
+   truncation bootstrap, each read back in one transaction. GAE (γ, λ),
+   reward clipping and return standardisation run on the CPU in f32.
+10. **Minibatching.** Each epoch shuffles row indices, gathers a
+    `batch_size` batch on the GPU (`select`), and slices it into
+    `mini_batch_size` minibatches with zero-copy `narrow`. Gradients are
+    accumulated across a batch's minibatches, weighted by size, then one
+    optimizer step is taken per batch.
+11. **PPO update.** Per minibatch: `Actic::forward_with` (precision per
+    network), `clipped_policy_loss` (surrogate with per-sample clip bounds,
+    entropy bonus, KL estimate, clip fraction) and an MSE value loss against the
+    GAE targets. Loss = policy loss − entropy_scale · entropy + value loss.
+    The optimizer is AdamW per network (actor, critic, shared head) with
+    gradient-norm clipping (0.5 by default) and optional separate learning
+    rates and LR schedule.
+12. **Weight sync.** There is no copy: collectors and learner share the same
+    device. Each iteration the learner hands `model.valid()` (a non-autodiff
+    view of the same parameters) to the collectors.
+13. **Checkpointing.** Every `timesteps_per_save` steps the learner writes
+    `checkpoints/<timesteps>/{actor,critic[,shared_head]}.bpk`, `stats.toml`
+    (counters and return statistics) and the optimizer state, keeping
+    `checkpoints_limit` folders. Self-play versions go under
+    `policy_versions/`. Models are always stored in f32.
+14. **Metrics.** Each iteration's `Report` goes over an mpsc channel to a
+    metrics actor thread that fans out to the TUI, wandb (its own thread,
+    bounded channel) and `metrics_jsonl`.
+15. **Export and deploy.** The actor can be written to safetensors with
+    PyTorch key names (`burn-store`, `BurnToPyTorchAdapter`) for Python
+    tooling, or loaded directly by `rlgymppo-rlbot`, which runs it on Burn
+    Flex on the CPU. Training precision never reaches the deploy path, so
+    Windows RLBot builds need no GPU or LibTorch.
+
+### Shapes and placement (Indonesian Coconut 1v1, 512 games, 100k steps per iteration)
+
+| Data | Shape | dtype | Lives on |
+|---|---|---|---|
+| Pool inference input | `[256 games × 2 players, 92]` | f32 | uploaded per step to the GPU |
+| Logits / log-probs | `[512, 90]` | f32 | GPU, sampled there |
+| Actions, sampled log-probs | `[512]` | i64 → `usize`, f32 | read back to the pool thread |
+| `Memory::states` | `[100k × 92]` flat | f32 | host RAM (~37 MB) |
+| `Memory::actions`, `log_probs`, `rewards`, `terminals` | `[100k]` | usize, f32, f32, u8 | host RAM |
+| `Memory::action_masks` | `[100k × 90]` flat | u8 | host RAM |
+| `Memory::trunc_next_states` | `[n_truncated × 92]` | f32 | host RAM |
+| Resident states | `[100k, 92]` | f16 | GPU (~18 MB) |
+| Old values, advantages, returns | `[100k]` | f32 | CPU (GAE), uploaded with the batch |
+| Training minibatch | `[50k, 92]` | f32 (bf16 inside matmuls when enabled) | GPU |
+| Actor | 92 → 2048 → 2048 → 1024 → 1024 → 90 | f32 params | GPU (7.8M params) |
+| Critic | 92 → 2048 → 2048 → 1024 → 1024 → 1 | f32 params | GPU (7.7M params) |
+
+### Threading and synchronization
+
+| Thread | Work | Talks to |
 |---|---|---|
-| Update-magnitude metrics are reduced on the GPU instead of downloading every weight each iteration | `rlgymppo/src/agent/update_magnitude.rs` | Always on (same metric, f32 accumulation) |
-| bf16 mixed precision for the PPO update, per network | `rlgymppo-model/src/precision.rs`, `PpoLearnerConfig::precision` | Off (f32) |
-| Clipped PPO loss extracted into a tested module | `rlgymppo/src/agent/ppo_loss.rs` | No behaviour change |
+| Main | `Learner::learn`: collection call, `Ppo::learn`, checkpoints | everything below |
+| Pool threads (`num_pools`, scoped per iteration) | Drive one `BatchSim`: inference on the GPU, then dispatch physics | own rayon pool; joined by `ThreadSim` |
+| Rayon workers (`num_threads_per_pool` per pool) | Step games, compute obs, rewards and terminals | write disjoint `MemoryShard` ranges, no locks |
+| Metrics actor | Aggregates `Report`s | mpsc from main and skill tracker |
+| wandb sender | Python wandb calls | bounded `sync_channel(1)` |
+| stdin reader | Pause, save, render controls | mpsc to main |
+| Skill tracker | Elo matches (sync or async) | mpsc metrics |
 
-### Recommended training setup
+Synchronization points per iteration: pool threads join at the end of
+collection (the only barrier between physics and learning, so collection and
+learning are sequential); each inference call reads back actions (one GPU
+sync per pool step); the value pass and truncation bootstrap each use one
+transaction readback; the PPO metrics and update magnitudes are read back once
+at the end of the update. Collection and learning do not overlap.
 
-Train on the LibTorch backend with TF32 matmuls and a bf16 critic; deploy with
-Burn Flex on the CPU exactly as upstream (weights are always stored in f32).
+## Backends and precision
+
+Burn 0.22 dispatches at runtime from a `Device`; the cargo features decide
+which backends are compiled in.
+
+| Backend | Feature | Use | Notes |
+|---|---|---|---|
+| Burn CUDA (cubecl) | `cuda` | Default GPU backend | f32 GEMMs are fine, but the full training step is ~1.8x slower than cuBLAS TF32. |
+| Burn CUDA + fusion | `cuda`, `fusion` | Kernel fusion | 9% faster in a microbenchmark, no measurable end-to-end gain. Not recommended. |
+| LibTorch | `torch` (`burn-tch`) | **Recommended for training** | cuBLAS kernels. Set `TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1` for TF32 matmuls. Needs PyTorch/LibTorch 2.9 (`tch` 0.22). Linux training only. |
+| Burn Flex | `flex` | CPU: tests, CI, RLBot deploy | Works on Windows. |
+| wgpu, Metal, ROCm | `wgpu`, `metal`, `rocm` | Other GPUs | Untested in this fork. |
+
+Precision (`PpoLearnerConfig::precision`, training step only):
+
+- `ComputePrecision::F32` (default): plain f32, or TF32 when the LibTorch
+  override is set.
+- `ComputePrecision::Bf16`: autocast-style. Activations and weights are cast
+  to bf16 for each matmul and bias add; parameters stay f32 (they are the
+  optimizer's master weights); layer norms run in f32; the network output is
+  cast back to f32, so log-softmax, ratios and losses are always f32.
+  Gradients flow back through the casts into the f32 parameters.
+
+Recommended: **bf16 critic, f32 policy**. In a warm-started A/B with the same
+learning rate, a bf16 policy raised the KL estimate about 5x (0.002 → 0.010)
+and the clip fraction from ~1-2% to ~6%, because bf16 rounding perturbs the
+probability ratio. A bf16 critic only adds noise to the value targets.
+
+## Configuration flags
+
+Fork additions and the flags that matter for speed. All other
+`PpoLearnerConfig` and `LearnerConfig` fields are unchanged from upstream and
+documented on the structs.
+
+| Flag | Default | Effect |
+|---|---|---|
+| `PpoLearnerConfig::precision.policy` | `F32` | Actor matmul precision in the update. |
+| `PpoLearnerConfig::precision.critic` | `F32` | Critic matmul precision in the update. |
+| `LearnerConfig::device` | default device + autodiff | Pick `Device::libtorch_cuda(0).autodiff()` for LibTorch. |
+| `TORCH_ALLOW_TF32_CUBLAS_OVERRIDE` env | unset | `1` enables TF32 on the LibTorch backend. |
+| `timesteps_per_iteration` / `batch_size` / `mini_batch_size` | 60k / 60k / 20k | Rollout size, optimizer-step size, forward/backward chunk. |
+| `gpu_timestep_buffer_size` | 60k | Chunk size of the value pass. |
+| `epochs` | 3 | Passes over each rollout. |
+| `num_pools`, `num_threads_per_pool`, `num_games_per_pool` | see `LearnerConfig` | Collection parallelism; 2 pools × 12 threads × 256 games is the bot's setup. |
+| cargo `fusion` | off | Burn kernel fusion. |
+
+## Performance
+
+1v1, 2048-2048-1024-1024 actor and critic, 2 epochs, 100k steps per
+iteration, 50k minibatch, 512 games, 2 pools × 12 threads, idle NVIDIA L4
+(g6.8xlarge), training from scratch, median of iterations 4-10.
+
+| Stage | Configuration | Steps/s | Learn time / iter |
+|---|---|---|---|
+| Baseline | Upstream `86bd822`, Burn CUDA f32 | 40.8k | 1.88 s |
+| 0 | + GPU update magnitudes | 43.8k | 1.76 s |
+| 0 | + Burn `fusion` | 43.3k | 1.76 s |
+| 1 | LibTorch f32 | 37.6k | 2.24 s |
+| 1 | LibTorch TF32 | 57.9k | 1.29 s |
+| 2 | LibTorch TF32 + bf16 critic (**recommended**) | 70.1k | 1.03 s |
+| 2 | LibTorch TF32 + bf16 critic and policy | 80.7k | 0.79 s |
+| 2 | Burn CUDA + bf16 critic and policy | 72.1k | 0.80 s |
+
+Warm-started from the real 1v1 policy with self-play, the recommended setup
+held ~76k steps/s over 150M steps. buta-ppo reaches ~111k at this net size.
+
+To benchmark: run a trainer with `num_additional_iterations` and
+`metrics_jsonl` set on an otherwise idle GPU and compare the medians of
+`Throughput/overall` and `Timing/consumption`, skipping the first three
+iterations.
+
+### Future work
+
+- **Values from rollout inference** (buta's stage 3). Here the value pass is
+  one batched forward over the resident rollout, ~0.08 s per 100k steps
+  (~6% of an iteration). Reusing values from collection would instead add a
+  critic forward to every small inference batch, which costs about as much as
+  the actor's ~0.28 s of collection inference. It only pays off once
+  collection inference is graph-captured, so it is deferred with the next
+  item.
+- **CUDA graphs and GPU-resident rollouts.** Need LibTorch graph capture,
+  which Burn does not expose.
+- **Overlapping collection with learning.**
+
+## Install and usage
+
+Requirements: Rust stable (edition 2024), RocketSim `collision_meshes/` next
+to the binary, and for the LibTorch backend a PyTorch 2.9 install.
 
 ```toml
-# your trainer's Cargo.toml
+[dependencies]
 rlgymppo = { git = "https://github.com/SentientPlatypus/indococo-ppo", default-features = false, features = ["cuda", "torch"] }
 ```
 
 ```rust
-let device = Device::libtorch_cuda(0).autodiff();
-let ppo = PpoLearnerConfig {
-    precision: TrainPrecision {
-        policy: ComputePrecision::F32,
-        critic: ComputePrecision::Bf16,
+use rlgymppo::{ComputePrecision, LearnerConfig, PpoLearnerConfig, TrainPrecision};
+
+let device = Device::libtorch_cuda(0);
+let config = LearnerConfig {
+    device: device.clone().autodiff(),
+    render_device: device,
+    ppo: PpoLearnerConfig {
+        precision: TrainPrecision {
+            policy: ComputePrecision::F32,
+            critic: ComputePrecision::Bf16,
+        },
+        ..Default::default()
     },
     ..Default::default()
 };
 ```
 
-Run with `TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1` so cuBLAS uses TF32 for f32
-matmuls, and point `LIBTORCH` (or `LIBTORCH_USE_PYTORCH=1`) at a PyTorch 2.9
-install, which is what `tch` 0.22 expects.
-
-Keep the policy in f32. In a warm-started A/B the bf16 policy raised the PPO
-KL about 5x and the clip fraction from ~1-2% to ~6% at the same learning
-rate, because bf16 rounding perturbs the probability ratio. It is available
-for experiments but is not validated.
-
-### Measured throughput
-
-1v1, 2048-2048-1024-1024 actor and critic (7.8M parameters each), 2 epochs,
-100k steps per iteration, 50k minibatch, 512 games, 24 threads, idle NVIDIA L4,
-training from scratch. Median of iterations 4-10.
-
-| Configuration | Steps/s | Learn time per iteration |
-|---|---|---|
-| Upstream `86bd822`, Burn CUDA f32 | 40.8k | 1.88 s |
-| + GPU update magnitudes | 43.8k | 1.76 s |
-| + Burn `fusion` | 43.3k | 1.76 s |
-| LibTorch f32 | 37.6k | 2.24 s |
-| LibTorch TF32 | 57.9k | 1.29 s |
-| LibTorch TF32 + bf16 critic (recommended) | 70.1k | 1.03 s |
-| LibTorch TF32 + bf16 critic and policy | 80.7k | 0.79 s |
-| Burn CUDA + bf16 critic and policy | 72.1k | 0.80 s |
-
-Burn's `fusion` feature made no measurable difference end to end, so it is not
-recommended. Warm-started training from a real policy measured about 75k
-steps/s with the recommended setup.
-
-### Not adopted (yet)
-
-- **Values from rollout inference.** buta-ppo returns critic values during
-  collection and skips the separate value pass. Here that pass costs ~0.08 s
-  per 100k-step iteration as one large batched forward, while running the
-  critic on every small collection batch would add a full critic forward to
-  each inference call. It is only a win with graph-captured inference, so it
-  is deferred together with the next item.
-- **CUDA graphs and GPU-resident rollouts.** These need raw LibTorch graph
-  capture that Burn does not expose. They are the remaining gap to buta-ppo
-  (about 111k steps/s at this net size).
-
-### Benchmarking
-
-Run any trainer built on this crate with `num_additional_iterations` set and
-`metrics_jsonl` enabled, then compare `Throughput/overall` and `Timing/consumption` medians after the first
-three iterations, with nothing else running on the GPU.
-
-### Development
-
 ```sh
-cargo +nightly fmt --check            # rustfmt.toml uses nightly-only options
-cargo clippy -p rlgymppo -p rlgymppo-model --no-default-features --features flex --all-targets -- -D warnings
-cargo test -p rlgymppo -p rlgymppo-model --no-default-features --features flex
+export LIBTORCH_USE_PYTORCH=1            # or LIBTORCH=/path/to/libtorch
+export TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1
+cargo run --release
 ```
 
-Environment tests need RocketSim's `collision_meshes/` folder at the
-workspace root (gitignored). `upstream` tracks VirxEC/rlgymppo_rs; rebase the
-fork commits onto it to pick up new work.
+The rest of the API (envs, rewards, self-play, checkpoints, RLBot deploy) is
+upstream's and is described in the upstream README below.
+
+## Development
+
+```sh
+cargo +nightly fmt --check   # rustfmt.toml uses nightly-only options
+cargo clippy -p rlgymppo -p rlgymppo-model --no-default-features --features flex --all-targets -- -D warnings
+cargo test -p rlgymppo -p rlgymppo-model --no-default-features --features flex
+# LibTorch backend tests
+LIBTORCH_USE_PYTORCH=1 cargo test -p rlgymppo --no-default-features --features torch --lib torch_
+```
+
+Environment tests need `collision_meshes/` at the workspace root (it is
+gitignored); CI skips them. To pick up upstream work:
+`git fetch upstream && git rebase upstream/master`.
 
 ---
 
-The upstream README follows.
+## Upstream README
 
 ## rlgymppo-rs
 
