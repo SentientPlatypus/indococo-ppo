@@ -3,8 +3,9 @@ use burn::nn::modules::norm::{Normalization, NormalizationConfig};
 use burn::nn::{Initializer, Linear, LinearConfig};
 use burn::prelude::*;
 use burn::tensor::activation::{log_softmax, relu, softmax};
-use burn::tensor::{Distribution, Transaction};
+use burn::tensor::{DType, Distribution, Transaction};
 
+use crate::precision::{ComputePrecision, TrainPrecision};
 use crate::tensor::{
     SampledActions, argmax_actions, sample_actions_from_logits, sample_actions_from_logits_tensor,
     sampled_actions_to_vec, to_mask_tensor_2d, to_mask_tensor_2d_flat, to_mask_tensor_2d_indexed,
@@ -101,13 +102,21 @@ impl Net {
     }
 
     pub fn forward(&self, input: Tensor<2>) -> Tensor<2> {
-        let mut output = input;
+        self.forward_with(input, ComputePrecision::F32)
+    }
 
-        let num_hidden = if self.has_output_layer {
-            self.linear_layers.len() - 1
-        } else {
-            self.linear_layers.len()
-        };
+    /// [`Net::forward`] with the matrix multiplications run at `precision`.
+    /// The output is always `f32`.
+    pub fn forward_with(&self, input: Tensor<2>, precision: ComputePrecision) -> Tensor<2> {
+        match precision {
+            ComputePrecision::F32 => self.forward_f32(input),
+            ComputePrecision::Bf16 => self.forward_bf16(input),
+        }
+    }
+
+    fn forward_f32(&self, input: Tensor<2>) -> Tensor<2> {
+        let mut output = input;
+        let num_hidden = self.num_hidden_layers();
 
         for (i, layer) in self.linear_layers[..num_hidden].iter().enumerate() {
             output = layer.forward(output);
@@ -121,6 +130,41 @@ impl Net {
             self.linear_layers[num_hidden].forward(output)
         } else {
             output
+        }
+    }
+
+    /// Autocast-style forward: `bf16` matmuls on `f32` master weights.
+    /// Normalization runs in `f32`, matching PyTorch autocast.
+    fn forward_bf16(&self, input: Tensor<2>) -> Tensor<2> {
+        let linear_bf16 = |layer: &Linear, x: Tensor<2>| {
+            let output = x.matmul(layer.weight.val().cast(DType::BF16));
+            match &layer.bias {
+                Some(bias) => output + bias.val().cast(DType::BF16).unsqueeze(),
+                None => output,
+            }
+        };
+
+        let num_hidden = self.num_hidden_layers();
+        let mut output = input.cast(DType::BF16);
+        for (i, layer) in self.linear_layers[..num_hidden].iter().enumerate() {
+            output = linear_bf16(layer, output);
+            if let Some(norm) = self.layer_norms.get(i) {
+                output = norm.forward(output.cast(DType::F32)).cast(DType::BF16);
+            }
+            output = relu(output);
+        }
+
+        if self.has_output_layer {
+            output = linear_bf16(&self.linear_layers[num_hidden], output);
+        }
+        output.cast(DType::F32)
+    }
+
+    fn num_hidden_layers(&self) -> usize {
+        if self.has_output_layer {
+            self.linear_layers.len() - 1
+        } else {
+            self.linear_layers.len()
         }
     }
 
@@ -246,7 +290,17 @@ impl Net {
     }
 
     pub fn masked_logits(&self, input: Tensor<2>, mask: Option<Tensor<2>>) -> Tensor<2> {
-        let logits = self.forward(input);
+        self.masked_logits_with(input, mask, ComputePrecision::F32)
+    }
+
+    /// [`Net::masked_logits`] with the matmuls run at `precision`.
+    pub fn masked_logits_with(
+        &self,
+        input: Tensor<2>,
+        mask: Option<Tensor<2>>,
+        precision: ComputePrecision,
+    ) -> Tensor<2> {
+        let logits = self.forward_with(input, precision);
         if let Some(mask) = mask {
             logits - (1.0 - mask) * 1e10_f32
         } else {
@@ -255,7 +309,18 @@ impl Net {
     }
 
     pub fn log_probs(&self, input: Tensor<2>, mask: Option<Tensor<2>>) -> Tensor<2> {
-        log_softmax(self.masked_logits(input, mask), 1)
+        self.log_probs_with(input, mask, ComputePrecision::F32)
+    }
+
+    /// [`Net::log_probs`] with the matmuls run at `precision`; the
+    /// log-softmax itself is always `f32`.
+    pub fn log_probs_with(
+        &self,
+        input: Tensor<2>,
+        mask: Option<Tensor<2>>,
+        precision: ComputePrecision,
+    ) -> Tensor<2> {
+        log_softmax(self.masked_logits_with(input, mask, precision), 1)
     }
 
     pub fn infer(&self, input: Tensor<2>, mask: Option<Tensor<2>>) -> Tensor<2> {
@@ -444,9 +509,22 @@ impl Actic {
     }
 
     pub fn forward(&self, input: Tensor<2>, mask: Option<Tensor<2>>) -> PPOOutput {
+        self.forward_with(input, mask, TrainPrecision::default())
+    }
+
+    /// [`Actic::forward`] with per-network matmul precision. The shared head,
+    /// when present, always runs in `f32`.
+    pub fn forward_with(
+        &self,
+        input: Tensor<2>,
+        mask: Option<Tensor<2>>,
+        precision: TrainPrecision,
+    ) -> PPOOutput {
         let features = self.apply_shared_head(input);
-        let log_probs = self.actor.log_probs(features.clone(), mask);
-        let values = self.critic.forward(features);
+        let log_probs = self
+            .actor
+            .log_probs_with(features.clone(), mask, precision.policy);
+        let values = self.critic.forward_with(features, precision.critic);
 
         PPOOutput::new(log_probs, values)
     }
@@ -733,5 +811,46 @@ mod tests {
         let entropy =
             |probs: &[f32]| -probs.iter().map(|p| p * p.max(1e-11).ln()).sum::<f32>() / 8.0;
         assert!(entropy(&soft) >= entropy(&base));
+    }
+
+    fn forward_values(net: &Net, input: &Tensor<2>, precision: ComputePrecision) -> Vec<f32> {
+        net.forward_with(input.clone(), precision)
+            .into_data()
+            .try_into_vec::<f32>()
+            .unwrap()
+    }
+
+    #[test]
+    fn f32_forward_with_matches_forward_exactly() {
+        let device = Default::default();
+        let net = Net::new(6, 3, vec![16, 8], &device, None, true);
+        let input = Tensor::<2>::random([5, 6], Distribution::Normal(0.0, 1.0), &device);
+        let expected = net
+            .forward(input.clone())
+            .into_data()
+            .try_into_vec::<f32>()
+            .unwrap();
+        assert_eq!(
+            forward_values(&net, &input, ComputePrecision::F32),
+            expected
+        );
+    }
+
+    #[test]
+    fn bf16_forward_is_f32_and_close_to_full_precision() {
+        let device = Default::default();
+        let net = Net::new(6, 3, vec![32, 32], &device, None, true);
+        let input = Tensor::<2>::random([64, 6], Distribution::Normal(0.0, 1.0), &device);
+
+        let output = net.forward_with(input.clone(), ComputePrecision::Bf16);
+        assert_eq!(output.dtype(), DType::F32);
+
+        let full = forward_values(&net, &input, ComputePrecision::F32);
+        let mixed = output.into_data().try_into_vec::<f32>().unwrap();
+        let scale = full.iter().fold(0f32, |acc, x| acc.max(x.abs())).max(1.0);
+        for (f, m) in full.iter().zip(&mixed) {
+            // bf16 keeps 8 mantissa bits; three layers stay well inside 5%.
+            assert!((f - m).abs() <= 0.05 * scale, "f32 {f} vs bf16 {m}");
+        }
     }
 }

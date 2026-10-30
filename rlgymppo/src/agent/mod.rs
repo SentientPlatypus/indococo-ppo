@@ -866,7 +866,7 @@ impl Ppo {
         let PPOOutput {
             log_probs: log_prob,
             values: value_batch,
-        } = net.forward(state_batch, mask_batch);
+        } = net.forward_with(state_batch, mask_batch, self.config.precision);
 
         let num_actions = log_prob.shape().dims::<2>()[1];
         let entropy_sum = -(log_prob.clone() * log_prob.clone().exp()).sum_dim(1);
@@ -1548,6 +1548,7 @@ mod runtime_device_tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use burn::optim::AdamWConfig;
+    use rlgymppo_model::{ComputePrecision, TrainPrecision};
 
     use super::*;
 
@@ -1579,7 +1580,7 @@ mod runtime_device_tests {
         (actor_gradients, critic_gradients, shared_head_gradients)
     }
 
-    fn exercise_full_learn(device: Device) {
+    fn exercise_full_learn(device: Device, precision: TrainPrecision) {
         let config = PpoLearnerConfig {
             epochs: 1,
             timesteps_per_iteration: 4,
@@ -1589,6 +1590,7 @@ mod runtime_device_tests {
             truncation_value_batch_size: 1,
             standardize_returns: false,
             standardize_advantages: false,
+            precision,
             ..Default::default()
         };
         let mut net = Actic::new(3, 2, vec![4], vec![4], &[4], &device, None);
@@ -1822,7 +1824,17 @@ mod runtime_device_tests {
     fn flex_regen_keeps_parameters_trainable_across_updates_and_optimizer_state_round_trips() {
         let device = Device::flex().autodiff();
         exercise_regen_and_optimizer_state_round_trip(device.clone());
-        exercise_full_learn(device);
+        exercise_full_learn(device, TrainPrecision::default());
+    }
+
+    #[cfg(feature = "flex")]
+    #[test]
+    fn flex_bf16_update_changes_f32_parameters() {
+        let precision = TrainPrecision {
+            policy: ComputePrecision::Bf16,
+            critic: ComputePrecision::Bf16,
+        };
+        exercise_full_learn(Device::flex().autodiff(), precision);
     }
 
     #[cfg(feature = "torch")]
@@ -1831,6 +1843,6 @@ mod runtime_device_tests {
     fn torch_regen_keeps_parameters_trainable_across_updates_and_optimizer_state_round_trips() {
         let device = Device::libtorch().autodiff();
         exercise_regen_and_optimizer_state_round_trip(device.clone());
-        exercise_full_learn(device);
+        exercise_full_learn(device, TrainPrecision::default());
     }
 }

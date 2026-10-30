@@ -1,6 +1,7 @@
 use burn::grad_clipping::GradientClippingConfig;
 use burn::optim::{AdamWConfig, ModuleOptimizer};
 use burn::tensor::Device;
+use rlgymppo_model::TrainPrecision;
 
 use super::Ppo;
 use super::model::{Actic, Net};
@@ -218,6 +219,9 @@ pub struct PpoLearnerConfig {
     /// Report plasticity diagnostics (`Update/* weight norm`, `stable rank`,
     /// `dormant frac`) every N updates. `None` (the default) disables them.
     pub plasticity_log_interval: Option<usize>,
+    /// Matmul precision of the actor and critic during the PPO update.
+    /// Defaults to `f32` for both; see [`TrainPrecision`].
+    pub precision: TrainPrecision,
 }
 
 impl Default for PpoLearnerConfig {
@@ -253,6 +257,7 @@ impl Default for PpoLearnerConfig {
             adaptive_clip: None,
             percentile_adv_scaling: None,
             plasticity_log_interval: None,
+            precision: TrainPrecision::default(),
         }
     }
 }

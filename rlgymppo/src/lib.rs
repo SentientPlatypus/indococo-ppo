@@ -42,6 +42,7 @@ use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng, rng};
 pub use rlgym::{self, rocketsim};
 use rlgym::{Action, Env, Obs, Reward, SharedInfoProvider, StateSetter, Terminal, Truncate};
+pub use rlgymppo_model::{ComputePrecision, TrainPrecision};
 use rlgymppo_model::{
     NormSelection as TeacherNormSelection, Policy as TeacherPolicy, PolicyConfig,
 };
