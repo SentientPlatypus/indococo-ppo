@@ -1832,4 +1832,15 @@ mod runtime_device_tests {
         exercise_regen_and_optimizer_state_round_trip(device.clone());
         exercise_full_learn(device, TrainPrecision::default());
     }
+
+    #[cfg(feature = "torch")]
+    #[test]
+    #[allow(deprecated)]
+    fn torch_bf16_update_changes_f32_parameters() {
+        let precision = TrainPrecision {
+            policy: ComputePrecision::Bf16,
+            critic: ComputePrecision::Bf16,
+        };
+        exercise_full_learn(Device::libtorch().autodiff(), precision);
+    }
 }
