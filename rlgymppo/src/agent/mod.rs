@@ -4,6 +4,7 @@ pub mod model;
 pub mod self_play;
 pub mod skill_tracker;
 pub mod transfer_learn;
+mod update_magnitude;
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -23,6 +24,7 @@ use crate::OptimizerNetwork;
 use crate::agent::config::{PpoLearnerConfig, RegenConfig};
 use crate::agent::gae::{GAEOutput, get_gae};
 use crate::agent::model::{Actic, Net, PPOOutput};
+use crate::agent::update_magnitude::ParamSnapshot;
 use crate::base::{Memory, TerminalState, get_batch_1d, get_states_batch_range};
 use crate::utils::running_stat::Stats;
 
@@ -413,12 +415,10 @@ impl Ppo {
             }
         }
 
-        // Snapshot parameters before training for update-magnitude computation.
-        // This downloads all weights to the CPU, so it is timed separately.
-        let snapshot_start = Instant::now();
-        let actor_params_before = flatten_net(&net.actor);
-        let critic_params_before = flatten_net(&net.critic);
-        metrics["PPO/param snapshot time"] = snapshot_start.elapsed().as_secs_f64().into();
+        // Keep handles to the pre-update parameters for update-magnitude
+        // metrics. This copies nothing; the norms are reduced on the device.
+        let actor_before = ParamSnapshot::capture(&net.actor);
+        let critic_before = ParamSnapshot::capture(&net.critic);
 
         // Upload ordered states once as `f16` and keep them resident on the
         // GPU. Value inference slices them with `narrow`, training gathers
@@ -763,10 +763,12 @@ impl Ppo {
             (mean_entropy * self.config.entropy_scale) / mean_policy_loss.abs().max(f32::EPSILON);
 
         // Compute parameter-update magnitudes (L2 norm of param diff).
-        let actor_params_after = flatten_net(&net.actor);
-        let critic_params_after = flatten_net(&net.critic);
-        let policy_magnitude = l2_diff(&actor_params_before, &actor_params_after);
-        let critic_magnitude = l2_diff(&critic_params_before, &critic_params_after);
+        let squared_distances = Transaction::default()
+            .register(actor_before.squared_distance(&net.actor))
+            .register(critic_before.squared_distance(&net.critic))
+            .execute();
+        let [policy_magnitude, critic_magnitude] =
+            [0, 1].map(|i| f64::from(squared_distances[i].try_to_vec::<f32>().unwrap()[0]).sqrt());
 
         metrics["Loss/entropy"] = mean_entropy.into();
         metrics["Loss/KL divergence"] = mean_divergence.into();
