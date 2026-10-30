@@ -116,7 +116,6 @@ where
         let tick_rate = Duration::from_secs_f32(consts::TICK_TIME);
         let tick_skip = ACT::get_tick_skip();
         let mut ticks_until_action = 0;
-        let mut actions = Vec::new();
         let mut next_time = Instant::now();
 
         loop {
@@ -163,7 +162,7 @@ where
             }
 
             if ticks_until_action == 0 {
-                actions = if deterministic {
+                let actions = if deterministic {
                     model.react_deterministic(&self.last_obs, &self.last_masks, &self.device)
                 } else {
                     model

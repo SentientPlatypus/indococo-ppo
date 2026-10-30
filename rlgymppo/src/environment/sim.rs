@@ -249,16 +249,6 @@ where
         self.finish_step()
     }
 
-    /// Step the renderer game for one policy interval. Training steps must use
-    /// [`Self::step`].
-    pub fn step_vis(&mut self, actions: &[ACT::Input]) -> StepResult {
-        self.begin_vis_step(actions);
-        for _ in 0..ACT::get_tick_skip() {
-            self.step_vis_tick();
-        }
-        self.finish_vis_step()
-    }
-
     /// Apply generic `ACT` actions to every car, then overwrite the selected
     /// cars with raw RocketSim controls (e.g. a fixed opponent policy)
     /// before simulating the step.
