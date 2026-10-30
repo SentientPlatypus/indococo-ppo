@@ -1,6 +1,7 @@
 pub mod config;
 mod gae;
 pub mod model;
+mod ppo_loss;
 pub mod self_play;
 pub mod skill_tracker;
 pub mod transfer_learn;
@@ -24,6 +25,7 @@ use crate::OptimizerNetwork;
 use crate::agent::config::{PpoLearnerConfig, RegenConfig};
 use crate::agent::gae::{GAEOutput, get_gae};
 use crate::agent::model::{Actic, Net, PPOOutput};
+use crate::agent::ppo_loss::{PolicyLoss, clipped_policy_loss};
 use crate::agent::update_magnitude::ParamSnapshot;
 use crate::base::{Memory, TerminalState, get_batch_1d, get_states_batch_range};
 use crate::utils::running_stat::Stats;
@@ -868,34 +870,19 @@ impl Ppo {
             values: value_batch,
         } = net.forward_with(state_batch, mask_batch, self.config.precision);
 
-        let num_actions = log_prob.shape().dims::<2>()[1];
-        let entropy_sum = -(log_prob.clone() * log_prob.clone().exp()).sum_dim(1);
-        let entropy_per_sample = if self.config.normalize_entropy {
-            entropy_sum / (num_actions as f32).ln()
-        } else {
-            entropy_sum
-        };
-        let entropy = entropy_per_sample.mean();
-
-        let action_log_prob = log_prob.gather(1, action_batch.clone());
-        let log_prob_diff = action_log_prob - old_log_probs_batch;
-        let ratios = log_prob_diff.clone().exp();
-        // Per-sample clip bounds (`clip_eps` is the fixed `clip_range` for
-        // every row unless adaptive clipping is enabled).
-        let lower = clip_eps_batch.clone().mul_scalar(-1.0).add_scalar(1.0);
-        let upper = clip_eps_batch.add_scalar(1.0);
-        let clipped_ratios = ratios.clone().min_pair(upper).max_pair(lower);
-        let kl_mean = ((ratios.clone() - 1.0) - log_prob_diff).mean();
-        let clip_fraction = clipped_ratios
-            .clone()
-            .sub(ratios.clone())
-            .abs()
-            .greater_elem(0.0)
-            .float()
-            .mean();
-        let actor_loss = -(ratios * advantage_batch.clone())
-            .min_pair(clipped_ratios * advantage_batch)
-            .mean();
+        let PolicyLoss {
+            actor_loss,
+            entropy,
+            kl: kl_mean,
+            clip_fraction,
+        } = clipped_policy_loss(
+            log_prob,
+            action_batch,
+            old_log_probs_batch,
+            advantage_batch,
+            clip_eps_batch,
+            self.config.normalize_entropy,
+        );
 
         let ppo_loss = actor_loss.clone() - entropy.clone() * self.config.entropy_scale;
         let critic_loss = MseLoss.forward(value_batch, target_vals_batch, Reduction::Mean);
