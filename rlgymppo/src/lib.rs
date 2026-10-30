@@ -18,12 +18,12 @@ use std::time::{Duration, Instant};
 
 use agent::Ppo;
 pub use agent::config::{
-    AdaptiveClipConfig, GaeEstimator, LrSchedule, PercentileAdvConfig, PpoLearnerConfig,
-    RegenConfig,
+    AdaptiveClipConfig, DecayShape, GaeEstimator, LrSchedule, PercentileAdvConfig,
+    PpoLearnerConfig, RegenConfig,
 };
 pub use agent::model::{Actic, Net, linear_weight_param_ids};
-pub use agent::self_play::SelfPlayConfig;
 use agent::self_play::VersionManager;
+pub use agent::self_play::{FixedOpponent, OpponentPick, SelfPlayConfig};
 pub use agent::skill_tracker::SkillTrackerConfig;
 use agent::skill_tracker::{AsyncSkillTracker, SkillTrackerUpdate, report_skill_ratings};
 pub use agent::transfer_learn::{TeacherConfig, TransferLearnConfig};
@@ -1207,27 +1207,32 @@ where
                 start_rendering.notify_all();
             }
 
-            // ── Self‑play: stochastically decide to use an old version ──
-            let self_play = if self.self_play_config.train_against_old_versions
-                && !self.version_mgr.is_empty()
-                && (self.rng.next_u32() as f64 / u32::MAX as f64)
-                    < self.self_play_config.train_against_old_chance as f64
-            {
-                let idx = self.version_mgr.random_index(&mut self.rng);
-                let old_team = if self.rng.next_u32().is_multiple_of(2) {
-                    0
-                } else {
-                    1
-                };
-                #[cfg(not(feature = "tui"))]
-                println!(
-                    " > Training against old version {} (team {})",
-                    self.version_mgr.versions[idx].timesteps, old_team
-                );
-                Some((self.version_mgr.versions[idx].model.clone(), old_team))
-            } else {
-                None
-            };
+            // ── Self‑play: stochastically pick a past version or fixed opponent ──
+            let self_play = self
+                .self_play_config
+                .pick_opponent(self.version_mgr.versions.len(), &mut self.rng)
+                .map(|pick| {
+                    let old_team = if self.rng.next_u32().is_multiple_of(2) {
+                        0
+                    } else {
+                        1
+                    };
+                    let (name, model) = match pick {
+                        OpponentPick::PastVersion(i) => {
+                            let v = &self.version_mgr.versions[i];
+                            (format!("old version {}", v.timesteps), v.model.clone())
+                        }
+                        OpponentPick::Fixed(i) => {
+                            let o = &self.self_play_config.fixed_opponents[i];
+                            (format!("fixed opponent {}", o.name), o.model.clone())
+                        }
+                    };
+                    #[cfg(not(feature = "tui"))]
+                    println!(" > Training against {name} (team {old_team})");
+                    #[cfg(feature = "tui")]
+                    let _ = name;
+                    (model, old_team)
+                });
 
             // collect steps
             let (memory, mut metrics) = self.collector.run(nodiff_model, self_play);

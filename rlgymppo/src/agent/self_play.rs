@@ -34,6 +34,97 @@ pub struct SelfPlayConfig {
     /// Probability (0.0 – 1.0) that a given training iteration will
     /// use an old version as the opponent.
     pub train_against_old_chance: f32,
+    /// Sampling weight of the saved past versions as a group, relative to
+    /// `fixed_opponents`. With no fixed opponents only the ratio to zero
+    /// matters, so the historical behavior is unchanged.
+    pub past_versions_weight: f32,
+    /// Frozen opponents that never rotate out (e.g. an imported reference
+    /// policy or a kept-best checkpoint), each with its sampling weight.
+    pub fixed_opponents: Vec<FixedOpponent>,
+}
+
+/// A frozen opponent policy in the training pool.
+#[derive(Clone, Debug)]
+pub struct FixedOpponent {
+    pub name: String,
+    pub model: Actic,
+    pub weight: f32,
+}
+
+/// The opponent chosen for one training iteration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpponentPick {
+    /// Index into `VersionManager::versions`.
+    PastVersion(usize),
+    /// Index into `SelfPlayConfig::fixed_opponents`.
+    Fixed(usize),
+}
+
+impl SelfPlayConfig {
+    /// Whether any iteration can be played against a non-current policy.
+    pub fn uses_opponents(&self) -> bool {
+        self.train_against_old_versions || !self.fixed_opponents.is_empty()
+    }
+
+    /// Picks the opponent for one iteration, or `None` for pure self-play.
+    ///
+    /// With probability `train_against_old_chance` an opponent is drawn:
+    /// the past versions as a group (uniform inside it, only if
+    /// `train_against_old_versions` and any exist) against each fixed
+    /// opponent, in proportion to their weights.
+    pub fn pick_opponent(&self, num_versions: usize, rng: &mut SmallRng) -> Option<OpponentPick> {
+        let past = if self.train_against_old_versions && num_versions > 0 {
+            self.past_versions_weight
+        } else {
+            0.0
+        };
+        let fixed: Vec<f32> = self.fixed_opponents.iter().map(|o| o.weight).collect();
+        pick_weighted(
+            self.train_against_old_chance,
+            past,
+            &fixed,
+            num_versions,
+            rng,
+        )
+    }
+}
+
+/// [`SelfPlayConfig::pick_opponent`] on plain weights (negative weights count as 0).
+fn pick_weighted(
+    chance: f32,
+    past_weight: f32,
+    fixed_weights: &[f32],
+    num_versions: usize,
+    rng: &mut SmallRng,
+) -> Option<OpponentPick> {
+    let past = past_weight.max(0.0);
+    let total = past + fixed_weights.iter().map(|w| w.max(0.0)).sum::<f32>();
+    if total <= 0.0 || unit(rng) >= chance {
+        return None;
+    }
+    let mut x = unit(rng) * total;
+    if x < past {
+        return Some(OpponentPick::PastVersion(
+            rng.next_u32() as usize % num_versions,
+        ));
+    }
+    x -= past;
+    for (i, &w) in fixed_weights.iter().enumerate() {
+        let w = w.max(0.0);
+        if x < w {
+            return Some(OpponentPick::Fixed(i));
+        }
+        x -= w;
+    }
+    // Float rounding at the top end.
+    fixed_weights
+        .iter()
+        .rposition(|&w| w > 0.0)
+        .map(OpponentPick::Fixed)
+}
+
+fn unit(rng: &mut SmallRng) -> f32 {
+    (rng.next_u32() >> 8) as f32 / (1u32 << 24) as f32
 }
 
 impl Default for SelfPlayConfig {
@@ -45,6 +136,8 @@ impl Default for SelfPlayConfig {
             max_saved_versions: Some(32),
             train_against_old_versions: false,
             train_against_old_chance: 0.15,
+            past_versions_weight: 1.0,
+            fixed_opponents: Vec::new(),
         }
     }
 }
@@ -89,16 +182,6 @@ impl VersionManager {
             config,
             save_folder,
         }
-    }
-
-    /// Whether any saved versions exist.
-    pub fn is_empty(&self) -> bool {
-        self.versions.is_empty()
-    }
-
-    /// Return a uniformly-random index into `self.versions`.
-    pub fn random_index(&self, rng: &mut SmallRng) -> usize {
-        rng.next_u32() as usize % self.versions.len()
     }
 
     /// Called after every training iteration.  Snapshots a new version
@@ -331,5 +414,57 @@ impl VersionManager {
                 self.versions.last().unwrap().timesteps
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod opponent_pick_tests {
+    use rand::SeedableRng;
+
+    use super::*;
+
+    /// (self-play, past-version, per-fixed) counts over 100k draws.
+    fn counts(chance: f32, past: f32, fixed: &[f32], versions: usize) -> (f64, f64, Vec<f64>) {
+        let mut rng = SmallRng::seed_from_u64(7);
+        let (mut none, mut old, mut fix) = (0.0, 0.0, vec![0.0; fixed.len()]);
+        for _ in 0..100_000 {
+            match pick_weighted(chance, past, fixed, versions, &mut rng) {
+                None => none += 1e-5,
+                Some(OpponentPick::PastVersion(i)) => {
+                    assert!(i < versions);
+                    old += 1e-5;
+                }
+                Some(OpponentPick::Fixed(i)) => fix[i] += 1e-5,
+            }
+        }
+        (none, old, fix)
+    }
+
+    #[test]
+    fn past_versions_only_matches_historical_chance() {
+        let (none, old, _) = counts(0.15, 1.0, &[], 3);
+        assert!((old - 0.15).abs() < 0.01);
+        assert!((none + old - 1.0).abs() < 1e-6);
+        assert!(
+            (counts(0.15, 0.0, &[], 0).0 - 1.0).abs() < 1e-6,
+            "no versions -> self-play"
+        );
+    }
+
+    #[test]
+    fn mix_follows_weights() {
+        let (none, old, fixed) = counts(0.4, 2.0, &[1.0, 1.0], 5);
+        assert!((none - 0.6).abs() < 0.01);
+        assert!((old - 0.2).abs() < 0.01);
+        assert!(fixed.iter().all(|f| (f - 0.1).abs() < 0.01));
+    }
+
+    #[test]
+    fn fixed_opponents_work_without_past_versions() {
+        let (none, old, fixed) = counts(0.4, 0.0, &[3.0, 0.0], 5);
+        assert_eq!(old, 0.0);
+        assert_eq!(fixed[1], 0.0);
+        assert!((fixed[0] - 0.4).abs() < 0.01);
+        assert!((none + fixed[0] - 1.0).abs() < 1e-6);
     }
 }

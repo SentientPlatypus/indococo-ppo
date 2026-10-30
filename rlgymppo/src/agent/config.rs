@@ -48,6 +48,23 @@ pub enum LrSchedule {
         decay_per_iteration: f32,
         min_scale: f32,
     },
+    /// Flat at `1.0` for `hold_iterations` updates, then decays to
+    /// `min_scale` over `decay_iterations` updates (linearly or along a
+    /// half cosine), then stays at `min_scale`.
+    HoldThenDecay {
+        hold_iterations: u64,
+        decay_iterations: u64,
+        min_scale: f32,
+        shape: DecayShape,
+    },
+}
+
+/// Shape of the decay segment of [`LrSchedule::HoldThenDecay`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DecayShape {
+    #[default]
+    Linear,
+    Cosine,
 }
 
 impl LrSchedule {
@@ -73,6 +90,20 @@ impl LrSchedule {
             } => f64::from(decay_per_iteration)
                 .powi(completed_updates.min(1_000_000_000) as i32)
                 .max(f64::from(min_scale)),
+            Self::HoldThenDecay {
+                hold_iterations,
+                decay_iterations,
+                min_scale,
+                shape,
+            } => {
+                let past = completed_updates.saturating_sub(hold_iterations) as f64;
+                let t = (past / decay_iterations.max(1) as f64).min(1.0);
+                let remaining = match shape {
+                    DecayShape::Linear => 1.0 - t,
+                    DecayShape::Cosine => 0.5 * (1.0 + (std::f64::consts::PI * t).cos()),
+                };
+                f64::from(min_scale) + (1.0 - f64::from(min_scale)) * remaining
+            }
         }
     }
 }
@@ -356,6 +387,31 @@ impl PpoLearnerConfig {
 #[cfg(test)]
 mod regression_tests {
     use super::*;
+
+    #[test]
+    fn hold_then_decay_holds_decays_and_floors() {
+        for shape in [DecayShape::Linear, DecayShape::Cosine] {
+            let s = LrSchedule::HoldThenDecay {
+                hold_iterations: 100,
+                decay_iterations: 50,
+                min_scale: 0.2,
+                shape,
+            };
+            assert_eq!(s.scale(0), 1.0);
+            assert_eq!(s.scale(100), 1.0);
+            assert!((s.scale(125) - 0.6).abs() < 1e-6, "{shape:?} midpoint");
+            assert!((s.scale(150) - 0.2).abs() < 1e-6);
+            assert!((s.scale(10_000) - 0.2).abs() < 1e-6);
+            assert!(s.scale(110) > s.scale(120));
+        }
+        let linear = LrSchedule::HoldThenDecay {
+            hold_iterations: 0,
+            decay_iterations: 10,
+            min_scale: 0.0,
+            shape: DecayShape::Linear,
+        };
+        assert!((linear.scale(3) - 0.7).abs() < 1e-6);
+    }
 
     #[test]
     fn regression_default_uses_truncated_gae() {

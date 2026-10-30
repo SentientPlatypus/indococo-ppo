@@ -153,6 +153,7 @@ fn default_config(
             max_saved_versions: None,
             train_against_old_versions: false,
             train_against_old_chance: 0.15,
+            ..Default::default()
         },
         skill_tracker: SkillTrackerConfig {
             enabled: true,
