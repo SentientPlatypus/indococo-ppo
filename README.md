@@ -1,3 +1,106 @@
+## indococo-ppo
+
+`indococo-ppo` is a fork of [VirxEC/rlgymppo_rs](https://github.com/VirxEC/rlgymppo_rs)
+tuned for training the Indonesian Coconut Rocket League bot faster on a single
+NVIDIA GPU. All credit for the framework goes to VirxEC and the rlgymppo_rs
+contributors; this fork only adds learner-side speedups, borrowing ideas from
+buta-ppo (MIT). It stays GPL-2.0, like upstream.
+
+Every change keeps upstream numerics by default. Faster numerics are opt-in.
+
+### What the fork changes
+
+| Change | Where | Default |
+|---|---|---|
+| Update-magnitude metrics are reduced on the GPU instead of downloading every weight each iteration | `rlgymppo/src/agent/update_magnitude.rs` | Always on (same metric, f32 accumulation) |
+| bf16 mixed precision for the PPO update, per network | `rlgymppo-model/src/precision.rs`, `PpoLearnerConfig::precision` | Off (f32) |
+| Clipped PPO loss extracted into a tested module | `rlgymppo/src/agent/ppo_loss.rs` | No behaviour change |
+
+### Recommended training setup
+
+Train on the LibTorch backend with TF32 matmuls and a bf16 critic; deploy with
+Burn Flex on the CPU exactly as upstream (weights are always stored in f32).
+
+```toml
+# your trainer's Cargo.toml
+rlgymppo = { git = "https://github.com/SentientPlatypus/indococo-ppo", default-features = false, features = ["cuda", "torch"] }
+```
+
+```rust
+let device = Device::libtorch_cuda(0).autodiff();
+let ppo = PpoLearnerConfig {
+    precision: TrainPrecision {
+        policy: ComputePrecision::F32,
+        critic: ComputePrecision::Bf16,
+    },
+    ..Default::default()
+};
+```
+
+Run with `TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1` so cuBLAS uses TF32 for f32
+matmuls, and point `LIBTORCH` (or `LIBTORCH_USE_PYTORCH=1`) at a PyTorch 2.9
+install, which is what `tch` 0.22 expects.
+
+Keep the policy in f32. In a warm-started A/B the bf16 policy raised the PPO
+KL about 5x and the clip fraction from ~1-2% to ~6% at the same learning
+rate, because bf16 rounding perturbs the probability ratio. It is available
+for experiments but is not validated.
+
+### Measured throughput
+
+1v1, 2048-2048-1024-1024 actor and critic (7.8M parameters each), 2 epochs,
+100k steps per iteration, 50k minibatch, 512 games, 24 threads, idle NVIDIA L4,
+training from scratch. Median of iterations 4-10.
+
+| Configuration | Steps/s | Learn time per iteration |
+|---|---|---|
+| Upstream `86bd822`, Burn CUDA f32 | 40.8k | 1.88 s |
+| + GPU update magnitudes | 43.8k | 1.76 s |
+| + Burn `fusion` | 43.3k | 1.76 s |
+| LibTorch f32 | 37.6k | 2.24 s |
+| LibTorch TF32 | 57.9k | 1.29 s |
+| LibTorch TF32 + bf16 critic (recommended) | 70.1k | 1.03 s |
+| LibTorch TF32 + bf16 critic and policy | 80.7k | 0.79 s |
+| Burn CUDA + bf16 critic and policy | 72.1k | 0.80 s |
+
+Burn's `fusion` feature made no measurable difference end to end, so it is not
+recommended. Warm-started training from a real policy measured about 75k
+steps/s with the recommended setup.
+
+### Not adopted (yet)
+
+- **Values from rollout inference.** buta-ppo returns critic values during
+  collection and skips the separate value pass. Here that pass costs ~0.08 s
+  per 100k-step iteration as one large batched forward, while running the
+  critic on every small collection batch would add a full critic forward to
+  each inference call. It is only a win with graph-captured inference, so it
+  is deferred together with the next item.
+- **CUDA graphs and GPU-resident rollouts.** These need raw LibTorch graph
+  capture that Burn does not expose. They are the remaining gap to buta-ppo
+  (about 111k steps/s at this net size).
+
+### Benchmarking
+
+Run any trainer built on this crate with `num_additional_iterations` set and
+`metrics_jsonl` enabled, then compare `Throughput/overall` and `Timing/consumption` medians after the first
+three iterations, with nothing else running on the GPU.
+
+### Development
+
+```sh
+cargo +nightly fmt --check            # rustfmt.toml uses nightly-only options
+cargo clippy -p rlgymppo -p rlgymppo-model --no-default-features --features flex --all-targets -- -D warnings
+cargo test -p rlgymppo -p rlgymppo-model --no-default-features --features flex
+```
+
+Environment tests need RocketSim's `collision_meshes/` folder at the
+workspace root (gitignored). `upstream` tracks VirxEC/rlgymppo_rs; rebase the
+fork commits onto it to pick up new work.
+
+---
+
+The upstream README follows.
+
 ## rlgymppo-rs
 
 A Rust implementation of Proximal Policy Optimization (PPO) for Rocket League
