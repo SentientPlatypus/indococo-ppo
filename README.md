@@ -6,8 +6,29 @@ learner-side speedups so the Indonesian Coconut bot trains faster on one
 NVIDIA GPU. The framework itself is VirxEC's work; see [Credits and
 license](#credits-and-license).
 
+## Speedup at a glance
+
+**About 1.7x faster than upstream rlgymppo_rs: 40.8k → 70.1k steps/s with
+the recommended LibTorch TF32 + bf16 critic.**
+
+| Configuration | Steps/s |
+|---|---|
+| Upstream `86bd822` (Burn CUDA f32) | 40.8k |
+| + GPU update magnitudes | 43.8k |
+| LibTorch TF32 | 57.9k |
+| LibTorch TF32 + bf16 critic (**recommended**) | **70.1k** |
+| LibTorch TF32 + bf16 critic and policy | 80.7k (off by default: raises the KL estimate ~5x) |
+
+Setup: g6.8xlarge (1 NVIDIA L4, 16-core/32-thread AMD EPYC 7R13). Every row
+uses the same 1v1 config: 2048-2048-1024-1024 actor and critic, 2 epochs,
+100k steps per iteration, 50k minibatch, 512 games, 2 pools × 12 threads,
+training from scratch, median of iterations 4-10. Sustained training runs
+(self-play, warm-started) hold about 62-76k steps/s. Full table, method and
+roadmap: [Performance](#performance).
+
 Contents:
 
+0. [Speedup at a glance](#speedup-at-a-glance)
 1. [Credits and license](#credits-and-license)
 2. [Differences from upstream](#differences-from-upstream)
 3. [Architecture](#architecture)
