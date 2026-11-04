@@ -9,6 +9,7 @@ use rlgymppo_utils::shared_info::SharedInfoReport;
 
 use super::batch_sim::BatchSim;
 use super::sim::RewardSamplingConfig;
+use crate::agent::external::OpponentRef;
 use crate::agent::model::Actic;
 use crate::base::{Memory, MemoryShard};
 
@@ -91,7 +92,7 @@ where
     pub(crate) fn run(
         &mut self,
         model: &Actic,
-        self_play: Option<(&Actic, usize)>,
+        self_play: Option<(OpponentRef<'_>, usize)>,
         share: usize,
     ) -> (Memory, Report) {
         self.remaining_steps.store(share, Ordering::Release);
@@ -112,7 +113,7 @@ where
     pub(crate) fn run_into_shard(
         &mut self,
         model: &Actic,
-        self_play: Option<(&Actic, usize)>,
+        self_play: Option<(OpponentRef<'_>, usize)>,
         share: usize,
         shard: &mut MemoryShard,
     ) -> Report {

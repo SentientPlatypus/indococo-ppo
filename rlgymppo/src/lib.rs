@@ -21,6 +21,7 @@ pub use agent::config::{
     AdaptiveClipConfig, DecayShape, GaeEstimator, LrSchedule, PercentileAdvConfig,
     PpoLearnerConfig, RegenConfig,
 };
+pub use agent::external::{ExternalOpponent, ExternalPolicy, Opponent, OpponentRef};
 pub use agent::model::{Actic, Net, linear_weight_param_ids};
 use agent::self_play::VersionManager;
 pub use agent::self_play::{FixedOpponent, OpponentPick, SelfPlayConfig};
@@ -1220,11 +1221,24 @@ where
                     let (name, model) = match pick {
                         OpponentPick::PastVersion(i) => {
                             let v = &self.version_mgr.versions[i];
-                            (format!("old version {}", v.timesteps), v.model.clone())
+                            (
+                                format!("old version {}", v.timesteps),
+                                Opponent::Model(v.model.clone()),
+                            )
                         }
                         OpponentPick::Fixed(i) => {
                             let o = &self.self_play_config.fixed_opponents[i];
-                            (format!("fixed opponent {}", o.name), o.model.clone())
+                            (
+                                format!("fixed opponent {}", o.name),
+                                Opponent::Model(o.model.clone()),
+                            )
+                        }
+                        OpponentPick::External(i) => {
+                            let o = &self.self_play_config.external_opponents[i];
+                            (
+                                format!("external opponent {}", o.name),
+                                Opponent::External(o.policy.clone()),
+                            )
                         }
                     };
                     #[cfg(not(feature = "tui"))]

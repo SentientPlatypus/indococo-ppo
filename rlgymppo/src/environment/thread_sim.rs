@@ -20,6 +20,7 @@ const COLLECT_MERGE_TIME_KEY: &str = "Collect/merge time";
 const COLLECT_POOL_MAX_WALL_TIME_KEY: &str = "Collect/pool max wall time";
 use super::pool_collector::PoolCollector;
 use super::sim::RewardSamplingConfig;
+use crate::agent::external::Opponent;
 use crate::agent::model::Actic;
 use crate::base::Memory;
 
@@ -117,7 +118,7 @@ where
 
     /// Publish the model (and optionally an old self-play model) and
     /// collect the resulting trajectories.
-    pub fn run(&mut self, model: Actic, self_play: Option<(Actic, usize)>) -> (&Memory, Report) {
+    pub fn run(&mut self, model: Actic, self_play: Option<(Opponent, usize)>) -> (&Memory, Report) {
         self.run_internal(model, self_play, self.rollout_budget)
     }
 
@@ -134,7 +135,7 @@ where
     fn run_internal(
         &mut self,
         model: Actic,
-        self_play: Option<(Actic, usize)>,
+        self_play: Option<(Opponent, usize)>,
         budget: usize,
     ) -> (&Memory, Report) {
         // Exact-budget path: every pool fills exactly its share (no
@@ -159,7 +160,9 @@ where
         self.metrics.clear();
 
         let shares = split_budget(budget, self.num_pools);
-        let self_play = self_play.as_ref().map(|(model, team)| (model, *team));
+        let self_play = self_play
+            .as_ref()
+            .map(|(model, team)| (model.as_ref(), *team));
         let model = &model;
 
         // Exact-budget path: every pool fills exactly its share (no

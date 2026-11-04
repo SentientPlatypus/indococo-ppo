@@ -41,6 +41,8 @@ pub struct SelfPlayConfig {
     /// Frozen opponents that never rotate out (e.g. an imported reference
     /// policy or a kept-best checkpoint), each with its sampling weight.
     pub fixed_opponents: Vec<FixedOpponent>,
+    /// Frozen non-`Actic` opponents (own obs/actions), each with its weight.
+    pub external_opponents: Vec<super::external::ExternalOpponent>,
 }
 
 /// A frozen opponent policy in the training pool.
@@ -58,12 +60,16 @@ pub enum OpponentPick {
     PastVersion(usize),
     /// Index into `SelfPlayConfig::fixed_opponents`.
     Fixed(usize),
+    /// Index into `SelfPlayConfig::external_opponents`.
+    External(usize),
 }
 
 impl SelfPlayConfig {
     /// Whether any iteration can be played against a non-current policy.
     pub fn uses_opponents(&self) -> bool {
-        self.train_against_old_versions || !self.fixed_opponents.is_empty()
+        self.train_against_old_versions
+            || !self.fixed_opponents.is_empty()
+            || !self.external_opponents.is_empty()
     }
 
     /// Picks the opponent for one iteration, or `None` for pure self-play.
@@ -78,7 +84,9 @@ impl SelfPlayConfig {
         } else {
             0.0
         };
-        let fixed: Vec<f32> = self.fixed_opponents.iter().map(|o| o.weight).collect();
+        let mut fixed: Vec<f32> = self.fixed_opponents.iter().map(|o| o.weight).collect();
+        fixed.extend(self.external_opponents.iter().map(|o| o.weight));
+        let n_fixed = self.fixed_opponents.len();
         pick_weighted(
             self.train_against_old_chance,
             past,
@@ -86,6 +94,10 @@ impl SelfPlayConfig {
             num_versions,
             rng,
         )
+        .map(|pick| match pick {
+            OpponentPick::Fixed(i) if i >= n_fixed => OpponentPick::External(i - n_fixed),
+            other => other,
+        })
     }
 }
 
@@ -138,6 +150,7 @@ impl Default for SelfPlayConfig {
             train_against_old_chance: 0.15,
             past_versions_weight: 1.0,
             fixed_opponents: Vec::new(),
+            external_opponents: Vec::new(),
         }
     }
 }
@@ -435,6 +448,7 @@ mod opponent_pick_tests {
                     old += 1e-5;
                 }
                 Some(OpponentPick::Fixed(i)) => fix[i] += 1e-5,
+                Some(OpponentPick::External(_)) => unreachable!("pick_weighted never returns External"),
             }
         }
         (none, old, fix)

@@ -11,8 +11,10 @@ use rlgymppo_utils::shared_info::SharedInfoReport;
 use rlgymppo_utils::{AvgTracker, Report};
 
 use super::sim::{GameInstance, RewardSamplingConfig};
+use crate::agent::external::{ExternalPolicy, OpponentRef};
 use crate::agent::model::Actic;
 use crate::base::{ClaimTarget, Memory, MemoryShard, TerminalState};
+use rlgym::rocketsim::CarControls;
 
 const EPISODE_LENGTH_EMA_ALPHA: f64 = 0.1;
 const MIN_TRAJECTORY_BASELINE_STEPS: usize = 32;
@@ -369,6 +371,9 @@ struct StepConfig<'a> {
     actions: &'a [usize],
     log_probs: &'a [f32],
     tracked: &'a [bool],
+    /// Per-player external-policy controls `(held, new)`; empty when unused.
+    overrides: &'a [Option<(CarControls, CarControls)>],
+    override_delay: u8,
 }
 
 /// Advance one game through the remainder of the decision interval.
@@ -415,7 +420,15 @@ fn step_game<SS, OBS, ACT, REW, TERM, TRUNC, SI>(
         }
     }
 
-    let result = if config.action_delay == 0 {
+    let ext: Vec<(usize, CarControls, CarControls)> = config
+        .overrides
+        .iter()
+        .enumerate()
+        .filter_map(|(p, o)| o.map(|(h, nw)| (p, h, nw)))
+        .collect();
+    let result = if !ext.is_empty() {
+        game.step_external(config.actions, &ext, config.override_delay)
+    } else if config.action_delay == 0 {
         game.step(config.actions)
     } else {
         game.finish_delayed_step(config.actions)
@@ -553,6 +566,14 @@ where
     self_play_old_indices: Vec<usize>,
     self_play_actions: Vec<usize>,
     self_play_log_probs: Vec<f32>,
+    /// External-opponent decision buffers (rows = untracked players).
+    ext_obs: Vec<f32>,
+    ext_masks: Vec<bool>,
+    ext_held: Vec<CarControls>,
+    /// Per-player `(held, new)` controls for the current decision; empty
+    /// unless an external opponent is playing.
+    ext_overrides: Vec<Option<(CarControls, CarControls)>>,
+    ext_delay: u8,
 }
 
 impl<SS, OBS, ACT, REW, TERM, TRUNC, SI> BatchSim<SS, OBS, ACT, REW, TERM, TRUNC, SI>
@@ -675,6 +696,11 @@ where
             self_play_old_indices: Vec::new(),
             self_play_actions: Vec::new(),
             self_play_log_probs: Vec::new(),
+            ext_obs: Vec::new(),
+            ext_masks: Vec::new(),
+            ext_held: Vec::new(),
+            ext_overrides: Vec::new(),
+            ext_delay: 0,
             max_episode_length,
             complete_trajectories,
             trajectory_baseline_steps: baseline_steps,
@@ -710,7 +736,7 @@ where
         remaining_steps: &AtomicUsize,
         memory_capacity_hint: usize,
         rollout_budget: usize,
-        self_play: Option<(&Actic, usize)>,
+        self_play: Option<(OpponentRef<'_>, usize)>,
         overbatching: bool,
         pool: Option<&ThreadPool>,
     ) -> (Memory, Report)
@@ -746,7 +772,7 @@ where
         model: &Actic,
         remaining_steps: &AtomicUsize,
         rollout_budget: usize,
-        self_play: Option<(&Actic, usize)>,
+        self_play: Option<(OpponentRef<'_>, usize)>,
         overbatching: bool,
         pool: Option<&ThreadPool>,
         shard: &mut MemoryShard,
@@ -803,7 +829,7 @@ where
         model: &Actic,
         remaining_steps: &AtomicUsize,
         rollout_budget: usize,
-        self_play: Option<(&Actic, usize)>,
+        self_play: Option<(OpponentRef<'_>, usize)>,
         overbatching: bool,
         pool: Option<&ThreadPool>,
         target: &mut impl ClaimTarget,
@@ -817,7 +843,15 @@ where
         TERM: Send,
         TRUNC: Send,
     {
-        let (old_model, old_team) = self_play.unzip();
+        let (opponent, old_team) = self_play.unzip();
+        let old_model = match opponent {
+            Some(OpponentRef::Model(m)) => Some(m),
+            _ => None,
+        };
+        let external = match opponent {
+            Some(OpponentRef::External(e)) => Some(e),
+            _ => None,
+        };
 
         let mut total_bookkeeping_time = 0.0_f64;
         let pre_start = Instant::now();
@@ -873,7 +907,20 @@ where
             let infer_start = Instant::now();
             let action_delay = ACT::get_action_delay();
 
-            let (actions, log_probs) = if let (Some(old_model), Some(_ot)) = (old_model, old_team) {
+            let (actions, log_probs) = if let (Some(ext), Some(_ot)) = (external, old_team) {
+                assert_eq!(
+                    action_delay, 0,
+                    "external opponents need a learner without action delay"
+                );
+                self.external_decision(
+                    model,
+                    ext,
+                    &player_is_tracked,
+                    pool,
+                    &mut total_submit_time,
+                    &mut total_wait_time,
+                )
+            } else if let (Some(old_model), Some(_ot)) = (old_model, old_team) {
                 self.self_play_current_indices.clear();
                 self.self_play_old_indices.clear();
                 for (index, &tracked) in player_is_tracked.iter().enumerate() {
@@ -979,6 +1026,7 @@ where
             let env_start = Instant::now();
 
             self.step_games_phase(pool, &actions, &log_probs, &player_is_tracked);
+            self.ext_overrides.clear();
 
             let (episode_steps, episode_squared_steps, episode_count) = self.claim_game_outcomes(
                 target,
@@ -1093,6 +1141,145 @@ where
         delay_start.elapsed().as_secs_f64()
     }
 
+    /// One decision with an external opponent on the untracked team: the
+    /// learner's rows go to the GPU first, the external observations are
+    /// built per game on the pool meanwhile, then the external policy runs
+    /// one batched inference. Untracked players get action 0 (their controls
+    /// are overridden in the step) and log prob 0.
+    fn external_decision(
+        &mut self,
+        model: &Actic,
+        ext: &dyn ExternalPolicy,
+        tracked: &[bool],
+        pool: Option<&ThreadPool>,
+        submit_time: &mut f64,
+        wait_time: &mut f64,
+    ) -> (Vec<usize>, Vec<f32>)
+    where
+        SS: Send,
+        SI: Send,
+        OBS: Send,
+        ACT: Send,
+        REW: Send,
+        TERM: Send,
+        TRUNC: Send,
+    {
+        self.self_play_current_indices.clear();
+        self.self_play_old_indices.clear();
+        for (index, &t) in tracked.iter().enumerate() {
+            if t {
+                self.self_play_current_indices.push(index);
+            } else {
+                self.self_play_old_indices.push(index);
+            }
+        }
+        let submit_start = Instant::now();
+        let pending = (!self.self_play_current_indices.is_empty()).then(|| {
+            model.submit_react_indexed_flat(
+                &self.next_obs,
+                self.state_width,
+                &self.next_masks,
+                self.mask_width,
+                &self.self_play_current_indices,
+                &self.device,
+            )
+        });
+        *submit_time += submit_start.elapsed().as_secs_f64();
+
+        let width = ext.obs_width();
+        let num_actions = ext.num_actions();
+        let rows = self.self_play_old_indices.len();
+        self.ext_obs.clear();
+        self.ext_obs.resize(rows * width, 0.0);
+        self.ext_masks.clear();
+        self.ext_masks.resize(rows * num_actions, false);
+        self.ext_held.clear();
+        self.ext_held.resize(rows, CarControls::default());
+
+        // Local untracked car indices per game, in global row order.
+        let per_game: Vec<Vec<usize>> = (0..self.games.len())
+            .map(|g| {
+                let start = self.player_offsets[g];
+                (0..self.np[g]).filter(|&l| !tracked[start + l]).collect()
+            })
+            .collect();
+        {
+            let mut obs = &mut self.ext_obs[..];
+            let mut masks = &mut self.ext_masks[..];
+            let mut held = &mut self.ext_held[..];
+            let mut jobs = Vec::with_capacity(self.games.len());
+            for (game, cars) in self.games.iter_mut().zip(&per_game) {
+                let k = cars.len();
+                let (o, o_rest) = obs.split_at_mut(k * width);
+                obs = o_rest;
+                let (m, m_rest) = masks.split_at_mut(k * num_actions);
+                masks = m_rest;
+                let (h, h_rest) = held.split_at_mut(k);
+                held = h_rest;
+                jobs.push((game, cars, o, m, h));
+            }
+            let run = |(game, cars, o, m, h): (
+                &mut GameInstance<SS, OBS, ACT, REW, TERM, TRUNC, SI>,
+                &Vec<usize>,
+                &mut [f32],
+                &mut [bool],
+                &mut [CarControls],
+            )| {
+                let state = game.last_game_state();
+                for (r, &car) in cars.iter().enumerate() {
+                    ext.build(
+                        state,
+                        car,
+                        &mut o[r * width..(r + 1) * width],
+                        &mut m[r * num_actions..(r + 1) * num_actions],
+                    );
+                    h[r] = state.cars[car].1.controls;
+                }
+            };
+            match pool {
+                Some(pool) => {
+                    let run = &run;
+                    pool.scope(|scope| {
+                        for job in jobs {
+                            scope.spawn(move |_| run(job));
+                        }
+                    });
+                }
+                None => jobs.into_iter().for_each(run),
+            }
+        }
+        let ext_actions = if rows > 0 {
+            ext.infer(&self.ext_obs, &self.ext_masks, rows)
+        } else {
+            Vec::new()
+        };
+
+        self.ext_delay = ext.action_delay();
+        self.ext_overrides.clear();
+        self.ext_overrides.resize(self.total_players, None);
+        for (r, &p) in self.self_play_old_indices.iter().enumerate() {
+            self.ext_overrides[p] = Some((self.ext_held[r], ext.controls(ext_actions[r])));
+        }
+
+        let wait_start = Instant::now();
+        let (current_actions, current_log_probs) = pending.map(|p| p.wait()).unwrap_or_default();
+        *wait_time += wait_start.elapsed().as_secs_f64();
+
+        let player_count = self.total_players;
+        self.self_play_actions.clear();
+        self.self_play_actions.resize(player_count, 0);
+        self.self_play_log_probs.clear();
+        self.self_play_log_probs.resize(player_count, 0.0);
+        for (offset, &index) in self.self_play_current_indices.iter().enumerate() {
+            self.self_play_actions[index] = current_actions[offset];
+            self.self_play_log_probs[index] = current_log_probs[offset];
+        }
+        (
+            mem::take(&mut self.self_play_actions),
+            mem::take(&mut self.self_play_log_probs),
+        )
+    }
+
     /// Advance every game through the remainder of the decision interval.
     /// With `pool`, one job per game; with `None`, the same work serially.
     /// Pool jobs never call `wait()` or touch the GPU.
@@ -1131,6 +1318,8 @@ where
             let next_old_obs = &mut self.next_old_obs;
             let next_masks = &mut self.next_masks;
             let player_trajs = &mut self.player_trajs;
+            let overrides = &self.ext_overrides;
+            let override_delay = self.ext_delay;
 
             pool.scope(|scope| {
                 let mut obs = &mut next_obs[..];
@@ -1169,6 +1358,12 @@ where
                         actions: &actions[player_start..player_start + n],
                         log_probs: &log_probs[player_start..player_start + n],
                         tracked: &player_is_tracked[player_start..player_start + n],
+                        overrides: if overrides.is_empty() {
+                            &[]
+                        } else {
+                            &overrides[player_start..player_start + n]
+                        },
+                        override_delay,
                     };
 
                     scope.spawn(move |_| {
@@ -1219,6 +1414,12 @@ where
                         actions: &actions[player_start..player_start + n],
                         log_probs: &log_probs[player_start..player_start + n],
                         tracked: &player_is_tracked[player_start..player_start + n],
+                        overrides: if self.ext_overrides.is_empty() {
+                            &[]
+                        } else {
+                            &self.ext_overrides[player_start..player_start + n]
+                        },
+                        override_delay: self.ext_delay,
                     },
                 );
             }

@@ -64,6 +64,7 @@ default; faster numerics are opt-in.
 | Clippy fixes (`render.rs`, removed unused `GameInstance::step_vis`) | `rlgymppo/src/environment/` | No behaviour change | `clippy -D warnings` passes. |
 | CI: rustfmt, clippy, CPU tests | `.github/workflows/ci.yml` | n/a | |
 | Documented LibTorch + TF32 training | this README | Opt-in via the existing `torch` feature | LibTorch's cuBLAS TF32 path is ~1.8x faster per training step than Burn CUDA f32. |
+| External (non-`Actic`) frozen opponents in the self-play pool | `rlgymppo/src/agent/external.rs`, `BatchSim::external_decision`, `GameInstance::step_external` | Off (empty `external_opponents`) | Train against a foreign bot with its own obs, action table and action delay (e.g. a GigaLearn bot ported to Rust). See [External opponents](#external-opponents). |
 
 Not adopted yet, with reasons, in [Roadmap](#roadmap-next-optimizations).
 
@@ -263,6 +264,26 @@ sequenceDiagram
 | Training minibatch | `[50k, 92]` | f32 (bf16 inside matmuls when enabled) | GPU |
 | Actor | 92 → 2048 → 2048 → 1024 → 1024 → 90 | f32 params | GPU (7.8M params) |
 | Critic | 92 → 2048 → 2048 → 1024 → 1024 → 1 | f32 params | GPU (7.7M params) |
+
+### External opponents
+
+`SelfPlayConfig::external_opponents` holds frozen policies that are not an
+`Actic`: anything implementing `ExternalPolicy` (`action_delay`, `obs_width`,
+`num_actions`, `build(state, car, obs, mask)`, batched `infer`, `controls`).
+They are drawn by weight together with the past versions and the fixed
+opponents (`OpponentPick::External`). In such an iteration the collector
+(`BatchSim::external_decision`):
+
+1. submits the learner's rows (tracked team) to the GPU as usual;
+2. meanwhile builds the external obs and masks from each game's
+   `GameState`, one rayon job per game;
+3. runs one batched `infer` for all external rows;
+4. steps each game with `GameInstance::step_external`: the external cars keep
+   their current controls for `action_delay` ticks, then the new action for
+   the rest of the tick skip (GigaLearn's `actionDelay = tickSkip - 1`).
+
+External players get action 0 and log prob 0 and are not recorded (they are
+untracked, like any opponent). The learner must not use an action delay itself.
 
 ### Threading and synchronization
 

@@ -265,6 +265,31 @@ where
         self.finish_step()
     }
 
+    /// [`Self::step`] where some cars are driven by an external policy:
+    /// each `(car, held, new)` keeps `held` for `delay` ticks, then `new`
+    /// for the rest of the interval.
+    pub fn step_external(
+        &mut self,
+        actions: &[ACT::Input],
+        overrides: &[(usize, CarControls, CarControls)],
+        delay: u8,
+    ) -> StepResult {
+        let tick_skip = ACT::get_tick_skip();
+        let delay = delay.min(tick_skip);
+        self.env.pre_step(&self.last_state, actions);
+        for &(car, held, _) in overrides {
+            self.env.arena.set_car_controls(car, held);
+        }
+        if delay > 0 {
+            self.env.step_physics(delay);
+        }
+        for &(car, _, new) in overrides {
+            self.env.arena.set_car_controls(car, new);
+        }
+        self.env.step_physics(tick_skip - delay);
+        self.finish_step()
+    }
+
     /// Advance the delayed portion of a policy decision interval using the
     /// previously selected action. Call [`Self::finish_delayed_step`] with the
     /// new action to complete the interval.
